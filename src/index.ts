@@ -1,13 +1,14 @@
+// IMPORTANT: Load environment variables FIRST, before any other imports
+// This ensures JWT_SECRET and other env vars are available when @capturit/shared initializes
+import dotenv from 'dotenv';
+dotenv.config();
+
 import express, { Request, Response, NextFunction } from 'express';
 import Stripe from 'stripe';
 import helmet from 'helmet';
 import cors from 'cors';
-import dotenv from 'dotenv';
-import { createDbClient, projects, invoices, briefs, projectSteps } from '@capturit/shared';
+import { createDbClient, projects, invoices, briefs, projectSteps, clientSubscriptions, projectTemplates } from '@capturit/shared';
 import { eq } from 'drizzle-orm';
-
-// Load environment variables
-dotenv.config();
 
 // Configuration
 const config = {
@@ -119,72 +120,125 @@ app.post(
   }
 );
 
-// Helper function to get default project steps based on plan type
-function getDefaultStepsForPlan(planId: string): Array<{ name: string; order: number; description: string }> {
-  // Normalize plan ID to lowercase for matching
+/**
+ * Detect project type from plan ID
+ */
+function detectProjectType(planId: string): string {
   const normalizedPlanId = planId.toLowerCase();
 
-  // Video/Film production plans
   if (normalizedPlanId.includes('video') || normalizedPlanId.includes('film') || normalizedPlanId.includes('clip')) {
-    return [
-      { name: 'Pre-production', order: 1, description: 'Script writing, storyboarding, and planning' },
-      { name: 'Filming', order: 2, description: 'On-location shooting and capture' },
-      { name: 'Post-production', order: 3, description: 'Editing, color grading, and sound design' },
-      { name: 'Review & Revisions', order: 4, description: 'Client feedback and adjustments' },
-      { name: 'Final Delivery', order: 5, description: 'Export and delivery of final files' }
-    ];
+    return 'video';
   }
-
-  // Web development plans
   if (normalizedPlanId.includes('web') || normalizedPlanId.includes('site') || normalizedPlanId.includes('website')) {
-    return [
-      { name: 'Design', order: 1, description: 'UI/UX design and mockups' },
-      { name: 'Development', order: 2, description: 'Frontend and backend implementation' },
-      { name: 'QA Testing', order: 3, description: 'Quality assurance and bug fixing' },
-      { name: 'Review & Revisions', order: 4, description: 'Client feedback and adjustments' },
-      { name: 'Deployment', order: 5, description: 'Launch and go-live' }
-    ];
+    return 'web';
   }
-
-  // Photography plans
   if (normalizedPlanId.includes('photo') || normalizedPlanId.includes('photography')) {
-    return [
-      { name: 'Planning', order: 1, description: 'Location scouting and shot list preparation' },
-      { name: 'Photo Shoot', order: 2, description: 'On-location photography session' },
-      { name: 'Selection', order: 3, description: 'Image selection and curation' },
-      { name: 'Retouching', order: 4, description: 'Professional photo editing and enhancement' },
-      { name: 'Final Delivery', order: 5, description: 'Export and delivery of final images' }
-    ];
+    return 'photo';
   }
-
-  // Branding/Design plans
   if (normalizedPlanId.includes('brand') || normalizedPlanId.includes('logo') || normalizedPlanId.includes('design')) {
-    return [
-      { name: 'Discovery', order: 1, description: 'Brand research and strategy development' },
-      { name: 'Concepts', order: 2, description: 'Initial design concepts and iterations' },
-      { name: 'Refinement', order: 3, description: 'Design refinement based on feedback' },
-      { name: 'Finalization', order: 4, description: 'Final designs and brand guidelines' },
-      { name: 'Delivery', order: 5, description: 'Export all assets and documentation' }
-    ];
+    return 'branding';
   }
 
-  // Default/Generic production steps (fallback for any plan type)
-  return [
-    { name: 'Planning', order: 1, description: 'Project planning and requirements gathering' },
-    { name: 'Production', order: 2, description: 'Main production work' },
-    { name: 'Review', order: 3, description: 'Client review and feedback' },
-    { name: 'Finalization', order: 4, description: 'Final adjustments and polish' },
-    { name: 'Delivery', order: 5, description: 'Final delivery to client' }
-  ];
+  return 'web'; // Default to web
 }
 
-// Handle successful checkout
+/**
+ * Fetch workflow template from database or use fallback
+ */
+async function getWorkflowTemplate(planId: string) {
+  const projectType = detectProjectType(planId);
+
+  try {
+    // Try to fetch template from database
+    const [template] = await db
+      .select()
+      .from(projectTemplates)
+      .where(eq(projectTemplates.projectType, projectType))
+      .limit(1);
+
+    if (template && template.defaultSteps) {
+      console.log(`[Workflow] Using database template: ${template.name}`);
+      return {
+        name: template.name,
+        steps: template.defaultSteps as Array<{
+          name: string;
+          description: string;
+          order: number;
+          estimatedDays?: number;
+          dependencies?: string[];
+        }>,
+        estimatedDuration: template.estimatedDuration
+      };
+    }
+  } catch (error) {
+    console.warn('[Workflow] Failed to fetch template from database, using fallback:', error);
+  }
+
+  // Fallback to hardcoded templates if database query fails
+  console.log(`[Workflow] Using fallback template for project type: ${projectType}`);
+
+  const fallbackTemplates: Record<string, any> = {
+    video: {
+      name: 'Vidéo Production (Fallback)',
+      steps: [
+        { name: 'Pre-production', order: 1, description: 'Script writing, storyboarding, and planning', estimatedDays: 5 },
+        { name: 'Filming', order: 2, description: 'On-location shooting and capture', estimatedDays: 2 },
+        { name: 'Post-production', order: 3, description: 'Editing, color grading, and sound design', estimatedDays: 7 },
+        { name: 'Review & Revisions', order: 4, description: 'Client feedback and adjustments', estimatedDays: 3 },
+        { name: 'Final Delivery', order: 5, description: 'Export and delivery of final files', estimatedDays: 1 }
+      ],
+      estimatedDuration: 18
+    },
+    web: {
+      name: 'Site Web Standard (Fallback)',
+      steps: [
+        { name: 'Design', order: 1, description: 'UI/UX design and mockups', estimatedDays: 7 },
+        { name: 'Development', order: 2, description: 'Frontend and backend implementation', estimatedDays: 14 },
+        { name: 'QA Testing', order: 3, description: 'Quality assurance and bug fixing', estimatedDays: 3 },
+        { name: 'Review & Revisions', order: 4, description: 'Client feedback and adjustments', estimatedDays: 3 },
+        { name: 'Deployment', order: 5, description: 'Launch and go-live', estimatedDays: 1 }
+      ],
+      estimatedDuration: 28
+    },
+    photo: {
+      name: 'Shooting Photo (Fallback)',
+      steps: [
+        { name: 'Planning', order: 1, description: 'Location scouting and shot list preparation', estimatedDays: 3 },
+        { name: 'Photo Shoot', order: 2, description: 'On-location photography session', estimatedDays: 1 },
+        { name: 'Selection', order: 3, description: 'Image selection and curation', estimatedDays: 2 },
+        { name: 'Retouching', order: 4, description: 'Professional photo editing and enhancement', estimatedDays: 5 },
+        { name: 'Final Delivery', order: 5, description: 'Export and delivery of final images', estimatedDays: 1 }
+      ],
+      estimatedDuration: 12
+    },
+    branding: {
+      name: 'Branding & Design (Fallback)',
+      steps: [
+        { name: 'Discovery', order: 1, description: 'Brand research and strategy development', estimatedDays: 5 },
+        { name: 'Concepts', order: 2, description: 'Initial design concepts and iterations', estimatedDays: 7 },
+        { name: 'Refinement', order: 3, description: 'Design refinement based on feedback', estimatedDays: 5 },
+        { name: 'Finalization', order: 4, description: 'Final designs and brand guidelines', estimatedDays: 3 },
+        { name: 'Delivery', order: 5, description: 'Export all assets and documentation', estimatedDays: 1 }
+      ],
+      estimatedDuration: 21
+    }
+  };
+
+  return fallbackTemplates[projectType] || fallbackTemplates.web;
+}
+
+// Handle successful checkout (Phoenix Workflow)
 async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) {
-  console.log('[Webhook] Processing checkout.session.completed:', session.id);
+  console.log('[Phoenix Webhook] Processing checkout.session.completed:', session.id);
+  console.log('[Phoenix Webhook] Metadata:', session.metadata);
 
   const checkoutSessionId = session.id;
   const paymentIntentId = session.payment_intent as string;
+  const subscriptionId = session.subscription as string;
+  const customerId = session.customer as string;
   const clientEmail = session.customer_email || session.customer_details?.email;
+  const metadata = session.metadata || {};
+  const caseType = metadata.case; // 'A', 'B', or 'C'
 
   // Find the invoice by checkout session ID
   const [invoice] = await db
@@ -194,11 +248,11 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
     .limit(1);
 
   if (!invoice) {
-    console.error('[Webhook] Invoice not found for session:', checkoutSessionId);
+    console.error('[Phoenix Webhook] Invoice not found for session:', checkoutSessionId);
     return;
   }
 
-  console.log('[Webhook] Found invoice:', invoice.id);
+  console.log('[Phoenix Webhook] Found invoice:', invoice.id, '| Case:', caseType);
 
   // Update invoice status to paid
   const [updatedInvoice] = await db
@@ -212,33 +266,65 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
     .where(eq(invoices.id, invoice.id))
     .returning();
 
-  console.log('[Webhook] Invoice marked as paid:', updatedInvoice.id);
+  console.log('[Phoenix Webhook] Invoice marked as paid:', updatedInvoice.id);
 
-  // Check if this invoice is for a plan (onboarding payment)
+  // === Handle Subscription Creation (Case A & C) ===
+  if (subscriptionId && (caseType === 'A' || caseType === 'C')) {
+    console.log('[Phoenix Webhook] Creating subscription record for:', subscriptionId);
+
+    // Fetch subscription details from Stripe
+    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+
+    // Extract plan ID from metadata
+    const planId = caseType === 'A'
+      ? invoice.planId
+      : (metadata.webPlanId || invoice.planId.split(',')[0]);
+
+    // Create client subscription record
+    await db.insert(clientSubscriptions).values({
+      clientId: invoice.clientId,
+      planId: planId,
+      stripeSubscriptionId: subscriptionId,
+      stripeCustomerId: customerId,
+      status: subscription.status === 'trialing' ? 'trialing' : 'active',
+      currentPeriodStart: new Date(subscription.current_period_start * 1000),
+      currentPeriodEnd: new Date(subscription.current_period_end * 1000),
+      trialEnd: subscription.trial_end ? new Date(subscription.trial_end * 1000) : null,
+      cancelAtPeriodEnd: false,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    });
+
+    console.log('[Phoenix Webhook] Subscription record created | Status:', subscription.status);
+  }
+
+  // === Create Project & Brief (All Cases) ===
   if (invoice.planId && invoice.planName) {
-    console.log('[Webhook] This is an onboarding payment for plan:', invoice.planName);
+    console.log('[Phoenix Webhook] Creating project for plan:', invoice.planName);
 
     // Create a new project with status 'onboarding_pending'
     const [newProject] = await db
       .insert(projects)
       .values({
         clientId: invoice.clientId,
-        title: `${invoice.planName} - Onboarding`,
-        description: `Project created from ${invoice.planName} plan purchase. Awaiting onboarding questionnaire completion.`,
+        title: `${invoice.planName}`,
+        description: invoice.description || `Project created from ${invoice.planName} plan purchase. Awaiting brief completion.`,
         status: 'onboarding_pending',
         budget: invoice.amount,
         metadata: {
           planId: invoice.planId,
           planName: invoice.planName,
           invoiceId: invoice.id,
-          createdVia: 'stripe_payment'
+          case: caseType,
+          createdVia: 'phoenix_workflow',
+          hasSubscription: !!subscriptionId
         },
         createdAt: new Date(),
         updatedAt: new Date()
       })
       .returning();
 
-    console.log('[Webhook] Project created:', newProject.id);
+    console.log('[Phoenix Webhook] Project created:', newProject.id);
 
     // Link invoice to project
     await db
@@ -249,7 +335,7 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
       })
       .where(eq(invoices.id, invoice.id));
 
-    console.log('[Webhook] Invoice linked to project');
+    console.log('[Phoenix Webhook] Invoice linked to project');
 
     // Create an empty brief for the project
     const [newBrief] = await db
@@ -258,39 +344,87 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
         projectId: newProject.id,
         clientId: invoice.clientId,
         status: 'pending',
-        content: [], // Empty array - to be filled by client
+        content: {}, // Empty object - to be filled by client
         createdAt: new Date(),
         updatedAt: new Date()
       })
       .returning();
 
-    console.log('[Webhook] Brief created:', newBrief.id);
+    console.log('[Phoenix Webhook] Brief created:', newBrief.id);
 
     // Create default project steps based on plan type
-    const defaultSteps = getDefaultStepsForPlan(invoice.planId);
-    console.log(`[Webhook] Creating ${defaultSteps.length} default steps for plan:`, invoice.planId);
+    // For mixed cart (Case C), use the primary plan (Web)
+    const primaryPlanId = caseType === 'C'
+      ? (metadata.webPlanId || invoice.planId.split(',')[0])
+      : invoice.planId;
 
-    for (const step of defaultSteps) {
+    const workflowTemplate = await getWorkflowTemplate(primaryPlanId);
+    console.log(`[Phoenix Webhook] Using template: ${workflowTemplate.name}`);
+    console.log(`[Phoenix Webhook] Creating ${workflowTemplate.steps.length} workflow steps`);
+
+    // Create a mapping of step names to their IDs for dependency resolution
+    const stepIdMap = new Map<string, string>();
+
+    // First pass: Create all steps
+    for (const stepDef of workflowTemplate.steps) {
+      // Generate a unique ID for this step (text-based for now)
+      const stepId = `${newProject.id}_step_${stepDef.order}`;
+      stepIdMap.set(stepDef.name, stepId);
+
+      // Calculate due date based on estimated days (if available)
+      let dueDate = null;
+      if (stepDef.estimatedDays) {
+        dueDate = new Date();
+        dueDate.setDate(dueDate.getDate() + stepDef.estimatedDays);
+      }
+
       await db.insert(projectSteps).values({
+        id: stepId,
         projectId: newProject.id,
-        name: step.name,
-        order: step.order,
-        description: step.description,
+        name: stepDef.name,
+        description: stepDef.description,
         status: 'pending',
+        order: stepDef.order,
+        // Workflow fields
+        assignedTo: null, // Will be assigned later by project manager
+        dueDate: dueDate,
+        startedAt: null,
+        completedAt: null,
+        dependsOn: stepDef.dependencies || null, // Store dependency names for now
+        deliverablesCount: 0,
+        metadata: {
+          estimatedDays: stepDef.estimatedDays,
+          templateName: workflowTemplate.name,
+          autoCreated: true
+        },
         createdAt: new Date(),
         updatedAt: new Date()
       });
     }
 
-    console.log('[Webhook] Project steps created successfully');
+    console.log('[Phoenix Webhook] Workflow steps created successfully');
+
+    // === Log Phoenix Workflow Summary ===
+    console.log('\n' + '='.repeat(60));
+    console.log('[Phoenix Workflow Summary]');
+    console.log(`Case: ${caseType}`);
+    console.log(`Plan: ${invoice.planName}`);
+    console.log(`Client: ${clientEmail}`);
+    console.log(`Project ID: ${newProject.id}`);
+    console.log(`Brief ID: ${newBrief.id}`);
+    if (subscriptionId) {
+      console.log(`Subscription ID: ${subscriptionId}`);
+      console.log(`Trial: 30 days (recurring starts ${new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toLocaleDateString()})`);
+    }
+    console.log('='.repeat(60) + '\n');
 
     // TODO: Send email notification to client about onboarding
-    console.log('[Webhook] TODO: Send email to client:', clientEmail);
+    console.log('[Phoenix Webhook] TODO: Send onboarding email to:', clientEmail);
   } else {
-    console.log('[Webhook] This is a regular invoice payment (not onboarding)');
+    console.log('[Phoenix Webhook] This is a regular invoice payment (not onboarding)');
   }
 
-  console.log('[Webhook] Checkout session completed successfully');
+  console.log('[Phoenix Webhook] Checkout session completed successfully');
 }
 
 // Handle expired checkout session
