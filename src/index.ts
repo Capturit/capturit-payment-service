@@ -7,7 +7,9 @@ import express, { Request, Response, NextFunction } from 'express';
 import Stripe from 'stripe';
 import helmet from 'helmet';
 import cors from 'cors';
-import { createDbClient, projects, invoices, briefs, projectSteps, clientSubscriptions, projectTemplates } from '@capturit/shared';
+import crypto from 'crypto';
+import bcrypt from 'bcryptjs';
+import { createDbClient, projects, invoices, briefs, projectSteps, clientSubscriptions, projectTemplates, refreshTokens, generateAccessToken, generateRefreshToken, users } from '@capturit/shared';
 import { eq } from 'drizzle-orm';
 
 // Configuration
@@ -39,6 +41,26 @@ const stripe = new Stripe(config.STRIPE_SECRET_KEY, {
 // Initialize Database
 const db = createDbClient(config.DATABASE_URL);
 
+// Temporary storage for auto-login tokens (session_id -> tokens)
+// In production, use Redis or similar
+const pendingAuthTokens = new Map<string, {
+  accessToken: string;
+  refreshToken: string;
+  userId: string;
+  email: string;
+  createdAt: Date;
+}>();
+
+// Clean up expired tokens every 5 minutes (tokens valid for 10 minutes)
+setInterval(() => {
+  const now = Date.now();
+  for (const [sessionId, data] of pendingAuthTokens.entries()) {
+    if (now - data.createdAt.getTime() > 10 * 60 * 1000) { // 10 minutes
+      pendingAuthTokens.delete(sessionId);
+    }
+  }
+}, 5 * 60 * 1000);
+
 // Initialize Express app
 const app = express();
 
@@ -58,6 +80,120 @@ app.get('/health', (_req: Request, res: Response) => {
     service: 'capturit-payment-service',
     timestamp: new Date().toISOString()
   });
+});
+
+// Auto-login endpoint - Exchange session_id for auth tokens after successful payment
+app.get('/auth/session/:sessionId', async (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+
+  console.log('[Auto-Login] Checking session:', sessionId);
+
+  // First, check if we have tokens in memory (fastest path)
+  const authData = pendingAuthTokens.get(sessionId);
+
+  if (authData) {
+    // Check if tokens are still valid (10 minute window)
+    const now = Date.now();
+    if (now - authData.createdAt.getTime() > 10 * 60 * 1000) {
+      pendingAuthTokens.delete(sessionId);
+      // Fall through to database lookup
+    } else {
+      // Return tokens and remove from pending (one-time use)
+      pendingAuthTokens.delete(sessionId);
+
+      console.log('[Auto-Login] Returning cached tokens for user:', authData.email);
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          accessToken: authData.accessToken,
+          refreshToken: authData.refreshToken,
+          userId: authData.userId,
+          email: authData.email
+        }
+      });
+    }
+  }
+
+  // Fallback: Look up user from database via invoice's stripeCheckoutSessionId
+  console.log('[Auto-Login] No cached tokens, checking database for session:', sessionId);
+
+  try {
+    // Find invoice with this checkout session ID
+    const [invoice] = await db
+      .select()
+      .from(invoices)
+      .where(eq(invoices.stripeCheckoutSessionId, sessionId))
+      .limit(1);
+
+    if (!invoice) {
+      console.log('[Auto-Login] No invoice found for session:', sessionId);
+      return res.status(404).json({
+        success: false,
+        error: 'Session not found'
+      });
+    }
+
+    // Check if invoice is paid (payment was successful)
+    if (invoice.status !== 'paid') {
+      console.log('[Auto-Login] Invoice not paid yet:', invoice.status);
+      return res.status(400).json({
+        success: false,
+        error: 'Payment not completed yet'
+      });
+    }
+
+    // Get the user associated with this invoice
+    const [user] = await db
+      .select()
+      .from(users)
+      .where(eq(users.id, invoice.clientId))
+      .limit(1);
+
+    if (!user) {
+      console.log('[Auto-Login] User not found for invoice:', invoice.id);
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    // Generate new tokens for the user
+    const userRoles = (user.roles as any)?.roles || ['client'];
+    const accessToken = generateAccessToken(user.id, user.email, userRoles);
+    const refreshTokenString = generateRefreshToken(user.id, user.email, userRoles);
+
+    // Hash refresh token before storing in database
+    const hashedRefreshToken = await bcrypt.hash(refreshTokenString, 10);
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 7); // 7 days
+
+    // Store refresh token in database
+    await db.insert(refreshTokens).values({
+      userId: user.id,
+      token: hashedRefreshToken,
+      expiresAt,
+    });
+
+    console.log('[Auto-Login] Generated new tokens from database for user:', user.email);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        accessToken,
+        refreshToken: refreshTokenString,
+        userId: user.id,
+        email: user.email
+      }
+    });
+
+  } catch (error) {
+    console.error('[Auto-Login] Database lookup error:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
 });
 
 // Stripe webhook endpoint - MUST use express.raw() for signature verification
@@ -240,62 +376,180 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
   const metadata = session.metadata || {};
   const caseType = metadata.case; // 'A', 'B', or 'C'
 
-  // Find the invoice by checkout session ID
-  const [invoice] = await db
-    .select()
-    .from(invoices)
-    .where(eq(invoices.stripeCheckoutSessionId, checkoutSessionId))
-    .limit(1);
+  // Check if this is a pending registration (new user flow)
+  if (metadata.pendingUserEmail) {
+    console.log('[Phoenix Webhook] Pending registration detected - creating user first');
 
-  if (!invoice) {
-    console.error('[Phoenix Webhook] Invoice not found for session:', checkoutSessionId);
-    return;
+    // Create the user account now that payment is successful
+    // Note: 'users' schema is imported statically at the top of the file
+
+    const [newUser] = await db.insert(users).values({
+      name: metadata.pendingUserFullName || `${metadata.pendingUserFirstName} ${metadata.pendingUserLastName}`,
+      email: metadata.pendingUserEmail,
+      password: metadata.pendingUserHashedPassword, // Already hashed
+      roles: { roles: ['client'] },
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    }).returning();
+
+    console.log('[Phoenix Webhook] User created:', newUser.id, newUser.email);
+
+    // Generate authentication tokens for auto-login after redirect
+    const userRoles = ['client'];
+    const accessToken = generateAccessToken(newUser.id, newUser.email, userRoles);
+    const refreshTokenString = generateRefreshToken(newUser.id, newUser.email, userRoles);
+
+    // Hash refresh token before storing in database
+    const hashedRefreshToken = await bcrypt.hash(refreshTokenString, 10);
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 7); // 7 days
+
+    // Store refresh token in database
+    await db.insert(refreshTokens).values({
+      userId: newUser.id,
+      token: hashedRefreshToken,
+      expiresAt,
+    });
+
+    // Store tokens in pending auth map for auto-login
+    pendingAuthTokens.set(checkoutSessionId, {
+      accessToken,
+      refreshToken: refreshTokenString,
+      userId: newUser.id,
+      email: newUser.email,
+      createdAt: new Date()
+    });
+
+    console.log('[Phoenix Webhook] Auth tokens generated and stored for session:', checkoutSessionId);
+
+    // Create invoice for this user
+    // Determine plan info based on case type
+    let planId: string;
+    let planName: string;
+
+    if (caseType === 'C') {
+      // Mixed cart: use web plan as primary (subscription)
+      planId = metadata.webPlanId || 'growth';
+      planName = `${metadata.webPlanId === 'growth' ? 'Growth' : metadata.webPlanId} + ${metadata.productionPlanId === 'signature' ? 'Signature' : metadata.productionPlanId}`;
+    } else if (caseType === 'A') {
+      // Web only
+      planId = metadata.webPlanId || metadata.planId || 'growth';
+      planName = metadata.webPlanId === 'growth' ? 'Growth' : (metadata.webPlanId || 'Formule Web');
+    } else {
+      // Production only (Case B)
+      planId = metadata.productionPlanId || metadata.planId || 'signature';
+      planName = metadata.productionPlanId === 'signature' ? 'Signature' : (metadata.productionPlanId || 'Production');
+    }
+
+    const invoiceNumber = `INV-${caseType}-${Date.now()}-${newUser.id.substring(0, 8)}`;
+    const [invoice] = await db.insert(invoices).values({
+      clientId: newUser.id,
+      invoiceNumber,
+      amount: metadata.totalAmount || '0',
+      currency: 'eur',
+      status: 'paid', // Payment already succeeded
+      paidAt: new Date(),
+      planId: planId,
+      planName: planName,
+      description: metadata.invoiceDescription || `${planName} - Paiement initial`,
+      stripeCheckoutSessionId: checkoutSessionId,
+      stripePaymentIntentId: paymentIntentId,
+      metadata: {
+        case: caseType,
+        type: metadata.planType,
+        ...metadata
+      },
+      createdAt: new Date(),
+      updatedAt: new Date()
+    }).returning();
+
+    console.log('[Phoenix Webhook] Invoice created:', invoice.id);
+
+    // Continue with project creation using the new user and invoice
+    const clientId = newUser.id;
+    await createProjectAndWorkflow(invoice, clientId, subscriptionId, customerId, caseType, metadata);
+
+  } else {
+    // Old flow: invoice already exists with clientId
+    const [invoice] = await db
+      .select()
+      .from(invoices)
+      .where(eq(invoices.stripeCheckoutSessionId, checkoutSessionId))
+      .limit(1);
+
+    if (!invoice) {
+      console.error('[Phoenix Webhook] Invoice not found for session:', checkoutSessionId);
+      return;
+    }
+
+    console.log('[Phoenix Webhook] Found invoice:', invoice.id, '| Case:', caseType);
+
+    // Update invoice status to paid
+    const [updatedInvoice] = await db
+      .update(invoices)
+      .set({
+        status: 'paid',
+        paidAt: new Date(),
+        stripePaymentIntentId: paymentIntentId,
+        updatedAt: new Date()
+      })
+      .where(eq(invoices.id, invoice.id))
+      .returning();
+
+    console.log('[Phoenix Webhook] Invoice marked as paid:', updatedInvoice.id);
+
+    await createProjectAndWorkflow(updatedInvoice, updatedInvoice.clientId, subscriptionId, customerId, caseType, metadata);
   }
 
-  console.log('[Phoenix Webhook] Found invoice:', invoice.id, '| Case:', caseType);
+  console.log('[Phoenix Webhook] Checkout session completed successfully');
+}
 
-  // Update invoice status to paid
-  const [updatedInvoice] = await db
-    .update(invoices)
-    .set({
-      status: 'paid',
-      paidAt: new Date(),
-      stripePaymentIntentId: paymentIntentId,
-      updatedAt: new Date()
-    })
-    .where(eq(invoices.id, invoice.id))
-    .returning();
-
-  console.log('[Phoenix Webhook] Invoice marked as paid:', updatedInvoice.id);
+// Extracted function to create project and workflow
+async function createProjectAndWorkflow(
+  invoice: any,
+  clientId: string,
+  subscriptionId: string,
+  customerId: string,
+  caseType: string,
+  metadata: any
+) {
+  console.log('[Phoenix Webhook] Creating project and workflow for client:', clientId);
 
   // === Handle Subscription Creation (Case A & C) ===
   if (subscriptionId && (caseType === 'A' || caseType === 'C')) {
     console.log('[Phoenix Webhook] Creating subscription record for:', subscriptionId);
 
-    // Fetch subscription details from Stripe
-    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+    try {
+      // Fetch subscription details from Stripe
+      const subscription = await stripe.subscriptions.retrieve(subscriptionId);
 
-    // Extract plan ID from metadata
-    const planId = caseType === 'A'
-      ? invoice.planId
-      : (metadata.webPlanId || invoice.planId.split(',')[0]);
+      // Extract plan ID from metadata
+      const planId = caseType === 'A'
+        ? invoice.planId
+        : (metadata.webPlanId || invoice.planId.split(',')[0]);
 
-    // Create client subscription record
-    await db.insert(clientSubscriptions).values({
-      clientId: invoice.clientId,
-      planId: planId,
-      stripeSubscriptionId: subscriptionId,
-      stripeCustomerId: customerId,
-      status: subscription.status === 'trialing' ? 'trialing' : 'active',
-      currentPeriodStart: new Date(subscription.current_period_start * 1000),
-      currentPeriodEnd: new Date(subscription.current_period_end * 1000),
-      trialEnd: subscription.trial_end ? new Date(subscription.trial_end * 1000) : null,
-      cancelAtPeriodEnd: false,
-      createdAt: new Date(),
-      updatedAt: new Date()
-    });
+      // Create client subscription record
+      await db.insert(clientSubscriptions).values({
+        id: crypto.randomUUID(),
+        clientId: clientId,
+        planId: planId,
+        stripeSubscriptionId: subscriptionId,
+        stripeCustomerId: customerId,
+        status: subscription.status === 'trialing' ? 'trialing' : 'active',
+        currentPeriodStart: new Date(subscription.current_period_start * 1000),
+        currentPeriodEnd: new Date(subscription.current_period_end * 1000),
+        trialEnd: subscription.trial_end ? new Date(subscription.trial_end * 1000) : null,
+        cancelAtPeriodEnd: false,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
 
-    console.log('[Phoenix Webhook] Subscription record created | Status:', subscription.status);
+      console.log('[Phoenix Webhook] Subscription record created | Status:', subscription.status);
+    } catch (subError) {
+      console.error('[Phoenix Webhook] Failed to create subscription record:', subError instanceof Error ? subError.message : subError);
+      // Continue with project creation even if subscription fails
+    }
   }
 
   // === Create Project & Brief (All Cases) ===
@@ -306,7 +560,7 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
     const [newProject] = await db
       .insert(projects)
       .values({
-        clientId: invoice.clientId,
+        clientId: clientId,
         title: `${invoice.planName}`,
         description: invoice.description || `Project created from ${invoice.planName} plan purchase. Awaiting brief completion.`,
         status: 'onboarding_pending',
@@ -342,7 +596,7 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
       .insert(briefs)
       .values({
         projectId: newProject.id,
-        clientId: invoice.clientId,
+        clientId: clientId,
         status: 'pending',
         content: {}, // Empty object - to be filled by client
         createdAt: new Date(),
@@ -367,8 +621,8 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
 
     // First pass: Create all steps
     for (const stepDef of workflowTemplate.steps) {
-      // Generate a unique ID for this step (text-based for now)
-      const stepId = `${newProject.id}_step_${stepDef.order}`;
+      // Generate a unique UUID for this step
+      const stepId = crypto.randomUUID();
       stepIdMap.set(stepDef.name, stepId);
 
       // Calculate due date based on estimated days (if available)
@@ -409,7 +663,7 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
     console.log('[Phoenix Workflow Summary]');
     console.log(`Case: ${caseType}`);
     console.log(`Plan: ${invoice.planName}`);
-    console.log(`Client: ${clientEmail}`);
+    console.log(`Client ID: ${clientId}`);
     console.log(`Project ID: ${newProject.id}`);
     console.log(`Brief ID: ${newBrief.id}`);
     if (subscriptionId) {
@@ -419,12 +673,10 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
     console.log('='.repeat(60) + '\n');
 
     // TODO: Send email notification to client about onboarding
-    console.log('[Phoenix Webhook] TODO: Send onboarding email to:', clientEmail);
+    console.log('[Phoenix Webhook] TODO: Send onboarding email to client:', clientId);
   } else {
     console.log('[Phoenix Webhook] This is a regular invoice payment (not onboarding)');
   }
-
-  console.log('[Phoenix Webhook] Checkout session completed successfully');
 }
 
 // Handle expired checkout session
