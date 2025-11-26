@@ -9,17 +9,17 @@ import helmet from 'helmet';
 import cors from 'cors';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
-import { createDbClient, projects, invoices, briefs, projectSteps, clientSubscriptions, projectTemplates, refreshTokens, generateAccessToken, generateRefreshToken, users } from '@capturit/shared';
+import { createDbClient, projects, invoices, briefs, projectSteps, clientSubscriptions, refreshTokens, generateAccessToken, generateRefreshToken, users, type UserRole } from '@capturit/shared';
 import { eq } from 'drizzle-orm';
 
-// Configuration
+// Configuration - Ports aligned with ARCHITECTURE (client-front: 3000, client-api: 3001, payment: 3002)
 const config = {
-  PORT: parseInt(process.env.PORT || '4005', 10),
+  PORT: parseInt(process.env.PORT || '3002', 10), // Payment service port per ARCHITECTURE
   NODE_ENV: process.env.NODE_ENV || 'development',
   DATABASE_URL: process.env.DATABASE_URL!,
   STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY!,
   STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET!,
-  CORS_ORIGIN: (process.env.CORS_ORIGIN || 'http://localhost:3004').split(',')
+  CORS_ORIGIN: (process.env.CORS_ORIGIN || 'http://localhost:3000').split(',') // Default: client-front
 };
 
 // Validate required env vars
@@ -159,7 +159,7 @@ app.get('/auth/session/:sessionId', async (req: Request, res: Response) => {
     }
 
     // Generate new tokens for the user
-    const userRoles = (user.roles as any)?.roles || ['client'];
+    const userRoles: UserRole[] = (user.roles as any)?.roles || ['client'];
     const accessToken = generateAccessToken(user.id, user.email, userRoles);
     const refreshTokenString = generateRefreshToken(user.id, user.email, userRoles);
 
@@ -279,43 +279,16 @@ function detectProjectType(planId: string): string {
 }
 
 /**
- * Fetch workflow template from database or use fallback
+ * Get workflow template based on plan type
+ * Uses hardcoded templates for now - can be extended to fetch from database later
  */
-async function getWorkflowTemplate(planId: string) {
+function getWorkflowTemplate(planId: string) {
   const projectType = detectProjectType(planId);
+  console.log(`[Workflow] Using template for project type: ${projectType}`);
 
-  try {
-    // Try to fetch template from database
-    const [template] = await db
-      .select()
-      .from(projectTemplates)
-      .where(eq(projectTemplates.projectType, projectType))
-      .limit(1);
-
-    if (template && template.defaultSteps) {
-      console.log(`[Workflow] Using database template: ${template.name}`);
-      return {
-        name: template.name,
-        steps: template.defaultSteps as Array<{
-          name: string;
-          description: string;
-          order: number;
-          estimatedDays?: number;
-          dependencies?: string[];
-        }>,
-        estimatedDuration: template.estimatedDuration
-      };
-    }
-  } catch (error) {
-    console.warn('[Workflow] Failed to fetch template from database, using fallback:', error);
-  }
-
-  // Fallback to hardcoded templates if database query fails
-  console.log(`[Workflow] Using fallback template for project type: ${projectType}`);
-
-  const fallbackTemplates: Record<string, any> = {
+  const templates: Record<string, any> = {
     video: {
-      name: 'Vidéo Production (Fallback)',
+      name: 'Vidéo Production',
       steps: [
         { name: 'Pre-production', order: 1, description: 'Script writing, storyboarding, and planning', estimatedDays: 5 },
         { name: 'Filming', order: 2, description: 'On-location shooting and capture', estimatedDays: 2 },
@@ -326,7 +299,7 @@ async function getWorkflowTemplate(planId: string) {
       estimatedDuration: 18
     },
     web: {
-      name: 'Site Web Standard (Fallback)',
+      name: 'Site Web Standard',
       steps: [
         { name: 'Design', order: 1, description: 'UI/UX design and mockups', estimatedDays: 7 },
         { name: 'Development', order: 2, description: 'Frontend and backend implementation', estimatedDays: 14 },
@@ -337,7 +310,7 @@ async function getWorkflowTemplate(planId: string) {
       estimatedDuration: 28
     },
     photo: {
-      name: 'Shooting Photo (Fallback)',
+      name: 'Shooting Photo',
       steps: [
         { name: 'Planning', order: 1, description: 'Location scouting and shot list preparation', estimatedDays: 3 },
         { name: 'Photo Shoot', order: 2, description: 'On-location photography session', estimatedDays: 1 },
@@ -348,7 +321,7 @@ async function getWorkflowTemplate(planId: string) {
       estimatedDuration: 12
     },
     branding: {
-      name: 'Branding & Design (Fallback)',
+      name: 'Branding & Design',
       steps: [
         { name: 'Discovery', order: 1, description: 'Brand research and strategy development', estimatedDays: 5 },
         { name: 'Concepts', order: 2, description: 'Initial design concepts and iterations', estimatedDays: 7 },
@@ -360,7 +333,7 @@ async function getWorkflowTemplate(planId: string) {
     }
   };
 
-  return fallbackTemplates[projectType] || fallbackTemplates.web;
+  return templates[projectType] || templates.web;
 }
 
 // Handle successful checkout (Phoenix Workflow)
@@ -384,10 +357,13 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
     // Note: 'users' schema is imported statically at the top of the file
 
     const [newUser] = await db.insert(users).values({
-      name: metadata.pendingUserFullName || `${metadata.pendingUserFirstName} ${metadata.pendingUserLastName}`,
+      firstName: metadata.pendingUserFirstName || metadata.pendingUserFullName?.split(' ')[0] || 'Client',
+      lastName: metadata.pendingUserLastName || metadata.pendingUserFullName?.split(' ').slice(1).join(' ') || '',
       email: metadata.pendingUserEmail,
       password: metadata.pendingUserHashedPassword, // Already hashed
-      roles: { roles: ['client'] },
+      companyName: metadata.pendingUserCompany || null,
+      phone: metadata.pendingUserPhone || null,
+      roles: { roles: ['client'] as UserRole[] },
       isActive: true,
       createdAt: new Date(),
       updatedAt: new Date()
@@ -396,7 +372,7 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
     console.log('[Phoenix Webhook] User created:', newUser.id, newUser.email);
 
     // Generate authentication tokens for auto-login after redirect
-    const userRoles = ['client'];
+    const userRoles: UserRole[] = ['client'];
     const accessToken = generateAccessToken(newUser.id, newUser.email, userRoles);
     const refreshTokenString = generateRefreshToken(newUser.id, newUser.email, userRoles);
 
@@ -612,7 +588,7 @@ async function createProjectAndWorkflow(
       ? (metadata.webPlanId || invoice.planId.split(',')[0])
       : invoice.planId;
 
-    const workflowTemplate = await getWorkflowTemplate(primaryPlanId);
+    const workflowTemplate = getWorkflowTemplate(primaryPlanId);
     console.log(`[Phoenix Webhook] Using template: ${workflowTemplate.name}`);
     console.log(`[Phoenix Webhook] Creating ${workflowTemplate.steps.length} workflow steps`);
 
@@ -639,17 +615,13 @@ async function createProjectAndWorkflow(
         description: stepDef.description,
         status: 'pending',
         order: stepDef.order,
-        // Workflow fields
-        assignedTo: null, // Will be assigned later by project manager
-        dueDate: dueDate,
-        startedAt: null,
-        completedAt: null,
-        dependsOn: stepDef.dependencies || null, // Store dependency names for now
-        deliverablesCount: 0,
+        startDate: null,
+        endDate: dueDate,
         metadata: {
           estimatedDays: stepDef.estimatedDays,
           templateName: workflowTemplate.name,
-          autoCreated: true
+          autoCreated: true,
+          dependencies: stepDef.dependencies || []
         },
         createdAt: new Date(),
         updatedAt: new Date()
