@@ -19,7 +19,8 @@ const config = {
   DATABASE_URL: process.env.DATABASE_URL!,
   STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY!,
   STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET!,
-  CORS_ORIGIN: (process.env.CORS_ORIGIN || 'http://localhost:3000').split(',') // Default: client-front
+  CORS_ORIGIN: (process.env.CORS_ORIGIN || 'http://localhost:3000').split(','), // Default: client-front
+  AUTH_SERVICE_URL: process.env.AUTH_SERVICE_URL || 'http://localhost:4005' // Centralized auth service
 };
 
 // Validate required env vars
