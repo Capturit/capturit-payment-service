@@ -9,18 +9,38 @@ import helmet from 'helmet';
 import cors from 'cors';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
-import { createDbClient, projects, invoices, briefs, projectSteps, clientSubscriptions, refreshTokens, generateAccessToken, generateRefreshToken, users, type UserRole } from '@capturit/shared';
+import {
+  createDbClient,
+  projects,
+  invoices,
+  briefs,
+  projectSteps,
+  clientSubscriptions,
+  refreshTokens,
+  generateAccessToken,
+  generateRefreshToken,
+  users,
+  type UserRole,
+  DEFAULT_PORTS,
+  getBackendConfig,
+  getFrontendConfig,
+} from '@capturit/shared';
 import { eq } from 'drizzle-orm';
 
-// Configuration - Ports aligned with ARCHITECTURE (client-front: 3000, client-api: 3001, payment: 3002)
+// Get centralized configuration
+const backendConfig = getBackendConfig();
+const frontendConfig = getFrontendConfig();
+
+// Configuration - Using centralized config from capturit-shared
 const config = {
-  PORT: parseInt(process.env.PORT || '3002', 10), // Payment service port per ARCHITECTURE
+  PORT: parseInt(process.env.PORT || String(DEFAULT_PORTS.PAYMENT_SERVICE), 10),
   NODE_ENV: process.env.NODE_ENV || 'development',
-  DATABASE_URL: process.env.DATABASE_URL!,
+  DATABASE_URL: process.env.DATABASE_URL || backendConfig.DATABASE_URL,
   STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY!,
   STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET!,
-  CORS_ORIGIN: (process.env.CORS_ORIGIN || 'http://localhost:3000').split(','), // Default: client-front
-  AUTH_SERVICE_URL: process.env.AUTH_SERVICE_URL || 'http://localhost:4005' // Centralized auth service
+  CORS_ORIGIN: (process.env.CORS_ORIGIN || frontendConfig.CLIENT_FRONT_URL).split(','),
+  AUTH_SERVICE_URL: process.env.AUTH_SERVICE_URL || backendConfig.AUTH_SERVICE_URL,
+  CLIENT_FRONTEND_URL: process.env.CLIENT_FRONTEND_URL || frontendConfig.CLIENT_FRONT_URL,
 };
 
 // Validate required env vars
