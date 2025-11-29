@@ -9,12 +9,10 @@ import helmet from 'helmet';
 import cors from 'cors';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
+import axios from 'axios';
 import {
   createDbClient,
-  projects,
   invoices,
-  briefs,
-  projectSteps,
   clientSubscriptions,
   refreshTokens,
   generateAccessToken,
@@ -24,8 +22,13 @@ import {
   DEFAULT_PORTS,
   getBackendConfig,
   getFrontendConfig,
+  getCorsOrigins,
 } from '@capturit/shared';
 import { eq } from 'drizzle-orm';
+
+// Catalog imports
+import { CatalogService } from './services/catalog.service';
+import { createCatalogRoutes } from './routes/catalog.routes';
 
 // Get centralized configuration
 const backendConfig = getBackendConfig();
@@ -38,9 +41,12 @@ const config = {
   DATABASE_URL: process.env.DATABASE_URL || backendConfig.DATABASE_URL,
   STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY!,
   STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET!,
-  CORS_ORIGIN: (process.env.CORS_ORIGIN || frontendConfig.CLIENT_FRONT_URL).split(','),
+  CORS_ORIGIN: getCorsOrigins(),
   AUTH_SERVICE_URL: process.env.AUTH_SERVICE_URL || backendConfig.AUTH_SERVICE_URL,
   CLIENT_FRONTEND_URL: process.env.CLIENT_FRONTEND_URL || frontendConfig.CLIENT_FRONT_URL,
+  // Project service for centralized project management
+  PROJECT_SERVICE_URL: process.env.PROJECT_SERVICE_URL || backendConfig.PROJECT_SERVICE_URL,
+  INTERNAL_SECRET: process.env.INTERNAL_SECRET || 'dev-internal-secret-change-in-production',
 };
 
 // Validate required env vars
@@ -61,6 +67,9 @@ const stripe = new Stripe(config.STRIPE_SECRET_KEY, {
 
 // Initialize Database
 const db = createDbClient(config.DATABASE_URL);
+
+// Initialize Catalog Service
+const catalogService = new CatalogService(db);
 
 // Temporary storage for auto-login tokens (session_id -> tokens)
 // In production, use Redis or similar
@@ -85,10 +94,12 @@ setInterval(() => {
 // Initialize Express app
 const app = express();
 
-// Security middleware
-app.use(helmet());
+// Security middleware - disable crossOriginResourcePolicy for CORS
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+}));
 
-// CORS
+// CORS - all frontends from getCorsOrigins()
 app.use(cors({
   origin: config.CORS_ORIGIN,
   credentials: true
@@ -102,6 +113,12 @@ app.get('/health', (_req: Request, res: Response) => {
     timestamp: new Date().toISOString()
   });
 });
+
+// ============================================
+// CATALOG ROUTES (JSON body parser)
+// Must be BEFORE webhook which uses raw body
+// ============================================
+app.use('/catalog', express.json(), createCatalogRoutes(catalogService));
 
 // Auto-login endpoint - Exchange session_id for auth tokens after successful payment
 app.get('/auth/session/:sessionId', async (req: Request, res: Response) => {
@@ -277,86 +294,6 @@ app.post(
   }
 );
 
-/**
- * Detect project type from plan ID
- */
-function detectProjectType(planId: string): string {
-  const normalizedPlanId = planId.toLowerCase();
-
-  if (normalizedPlanId.includes('video') || normalizedPlanId.includes('film') || normalizedPlanId.includes('clip')) {
-    return 'video';
-  }
-  if (normalizedPlanId.includes('web') || normalizedPlanId.includes('site') || normalizedPlanId.includes('website')) {
-    return 'web';
-  }
-  if (normalizedPlanId.includes('photo') || normalizedPlanId.includes('photography')) {
-    return 'photo';
-  }
-  if (normalizedPlanId.includes('brand') || normalizedPlanId.includes('logo') || normalizedPlanId.includes('design')) {
-    return 'branding';
-  }
-
-  return 'web'; // Default to web
-}
-
-/**
- * Get workflow template based on plan type
- * Uses hardcoded templates for now - can be extended to fetch from database later
- */
-function getWorkflowTemplate(planId: string) {
-  const projectType = detectProjectType(planId);
-  console.log(`[Workflow] Using template for project type: ${projectType}`);
-
-  const templates: Record<string, any> = {
-    video: {
-      name: 'Vidéo Production',
-      steps: [
-        { name: 'Pre-production', order: 1, description: 'Script writing, storyboarding, and planning', estimatedDays: 5 },
-        { name: 'Filming', order: 2, description: 'On-location shooting and capture', estimatedDays: 2 },
-        { name: 'Post-production', order: 3, description: 'Editing, color grading, and sound design', estimatedDays: 7 },
-        { name: 'Review & Revisions', order: 4, description: 'Client feedback and adjustments', estimatedDays: 3 },
-        { name: 'Final Delivery', order: 5, description: 'Export and delivery of final files', estimatedDays: 1 }
-      ],
-      estimatedDuration: 18
-    },
-    web: {
-      name: 'Site Web Standard',
-      steps: [
-        { name: 'Design', order: 1, description: 'UI/UX design and mockups', estimatedDays: 7 },
-        { name: 'Development', order: 2, description: 'Frontend and backend implementation', estimatedDays: 14 },
-        { name: 'QA Testing', order: 3, description: 'Quality assurance and bug fixing', estimatedDays: 3 },
-        { name: 'Review & Revisions', order: 4, description: 'Client feedback and adjustments', estimatedDays: 3 },
-        { name: 'Deployment', order: 5, description: 'Launch and go-live', estimatedDays: 1 }
-      ],
-      estimatedDuration: 28
-    },
-    photo: {
-      name: 'Shooting Photo',
-      steps: [
-        { name: 'Planning', order: 1, description: 'Location scouting and shot list preparation', estimatedDays: 3 },
-        { name: 'Photo Shoot', order: 2, description: 'On-location photography session', estimatedDays: 1 },
-        { name: 'Selection', order: 3, description: 'Image selection and curation', estimatedDays: 2 },
-        { name: 'Retouching', order: 4, description: 'Professional photo editing and enhancement', estimatedDays: 5 },
-        { name: 'Final Delivery', order: 5, description: 'Export and delivery of final images', estimatedDays: 1 }
-      ],
-      estimatedDuration: 12
-    },
-    branding: {
-      name: 'Branding & Design',
-      steps: [
-        { name: 'Discovery', order: 1, description: 'Brand research and strategy development', estimatedDays: 5 },
-        { name: 'Concepts', order: 2, description: 'Initial design concepts and iterations', estimatedDays: 7 },
-        { name: 'Refinement', order: 3, description: 'Design refinement based on feedback', estimatedDays: 5 },
-        { name: 'Finalization', order: 4, description: 'Final designs and brand guidelines', estimatedDays: 3 },
-        { name: 'Delivery', order: 5, description: 'Export all assets and documentation', estimatedDays: 1 }
-      ],
-      estimatedDuration: 21
-    }
-  };
-
-  return templates[projectType] || templates.web;
-}
-
 // Handle successful checkout (Phoenix Workflow)
 async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) {
   console.log('[Phoenix Webhook] Processing checkout.session.completed:', session.id);
@@ -503,6 +440,7 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
 }
 
 // Extracted function to create project and workflow
+// Now delegates to project-service for centralized project management
 async function createProjectAndWorkflow(
   invoice: any,
   clientId: string,
@@ -514,6 +452,7 @@ async function createProjectAndWorkflow(
   console.log('[Phoenix Webhook] Creating project and workflow for client:', clientId);
 
   // === Handle Subscription Creation (Case A & C) ===
+  // Subscription management stays in payment-service (Stripe-related)
   if (subscriptionId && (caseType === 'A' || caseType === 'C')) {
     console.log('[Phoenix Webhook] Creating subscription record for:', subscriptionId);
 
@@ -549,121 +488,90 @@ async function createProjectAndWorkflow(
     }
   }
 
-  // === Create Project & Brief (All Cases) ===
+  // === Create Project & Brief via Project Service ===
   if (invoice.planId && invoice.planName) {
-    console.log('[Phoenix Webhook] Creating project for plan:', invoice.planName);
+    console.log('[Phoenix Webhook] Calling project-service to create project for plan:', invoice.planName);
 
-    // Create a new project with status 'onboarding_pending'
-    const [newProject] = await db
-      .insert(projects)
-      .values({
-        clientId: clientId,
-        title: `${invoice.planName}`,
-        description: invoice.description || `Project created from ${invoice.planName} plan purchase. Awaiting brief completion.`,
-        status: 'onboarding_pending',
-        budget: invoice.amount,
-        metadata: {
+    try {
+      // Call project-service internal endpoint
+      const response = await axios.post(
+        `${config.PROJECT_SERVICE_URL}/internal/projects/create-with-workflow`,
+        {
+          clientId,
           planId: invoice.planId,
           planName: invoice.planName,
           invoiceId: invoice.id,
-          case: caseType,
-          createdVia: 'phoenix_workflow',
-          hasSubscription: !!subscriptionId
+          budget: invoice.amount,
+          description: invoice.description || `Project created from ${invoice.planName} plan purchase. Awaiting brief completion.`,
+          metadata: {
+            case: caseType,
+            createdVia: 'phoenix_workflow',
+            hasSubscription: !!subscriptionId,
+            webPlanId: metadata.webPlanId,
+            productionPlanId: metadata.productionPlanId,
+          }
         },
-        createdAt: new Date(),
-        updatedAt: new Date()
-      })
-      .returning();
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Internal-Secret': config.INTERNAL_SECRET,
+          },
+          timeout: 10000, // 10 second timeout
+        }
+      );
 
-    console.log('[Phoenix Webhook] Project created:', newProject.id);
+      if (response.data.success) {
+        const { project, brief, steps } = response.data.data;
+        console.log('[Phoenix Webhook] Project created via project-service:', project.id);
+        console.log('[Phoenix Webhook] Brief created:', brief.id);
+        console.log(`[Phoenix Webhook] ${steps.length} workflow steps created`);
 
-    // Link invoice to project
-    await db
-      .update(invoices)
-      .set({
-        projectId: newProject.id,
-        updatedAt: new Date()
-      })
-      .where(eq(invoices.id, invoice.id));
+        // Link invoice to project (stays in payment-service)
+        await db
+          .update(invoices)
+          .set({
+            projectId: project.id,
+            updatedAt: new Date()
+          })
+          .where(eq(invoices.id, invoice.id));
 
-    console.log('[Phoenix Webhook] Invoice linked to project');
+        console.log('[Phoenix Webhook] Invoice linked to project');
 
-    // Create an empty brief for the project
-    const [newBrief] = await db
-      .insert(briefs)
-      .values({
-        projectId: newProject.id,
-        clientId: clientId,
-        status: 'pending',
-        content: {}, // Empty object - to be filled by client
-        createdAt: new Date(),
-        updatedAt: new Date()
-      })
-      .returning();
-
-    console.log('[Phoenix Webhook] Brief created:', newBrief.id);
-
-    // Create default project steps based on plan type
-    // For mixed cart (Case C), use the primary plan (Web)
-    const primaryPlanId = caseType === 'C'
-      ? (metadata.webPlanId || invoice.planId.split(',')[0])
-      : invoice.planId;
-
-    const workflowTemplate = getWorkflowTemplate(primaryPlanId);
-    console.log(`[Phoenix Webhook] Using template: ${workflowTemplate.name}`);
-    console.log(`[Phoenix Webhook] Creating ${workflowTemplate.steps.length} workflow steps`);
-
-    // Create a mapping of step names to their IDs for dependency resolution
-    const stepIdMap = new Map<string, string>();
-
-    // First pass: Create all steps
-    for (const stepDef of workflowTemplate.steps) {
-      // Generate a unique UUID for this step
-      const stepId = crypto.randomUUID();
-      stepIdMap.set(stepDef.name, stepId);
-
-      // Calculate due date based on estimated days (if available)
-      let dueDate = null;
-      if (stepDef.estimatedDays) {
-        dueDate = new Date();
-        dueDate.setDate(dueDate.getDate() + stepDef.estimatedDays);
+        // === Log Phoenix Workflow Summary ===
+        console.log('\n' + '='.repeat(60));
+        console.log('[Phoenix Workflow Summary]');
+        console.log(`Case: ${caseType}`);
+        console.log(`Plan: ${invoice.planName}`);
+        console.log(`Client ID: ${clientId}`);
+        console.log(`Project ID: ${project.id}`);
+        console.log(`Brief ID: ${brief.id}`);
+        console.log(`Steps: ${steps.length}`);
+        if (subscriptionId) {
+          console.log(`Subscription ID: ${subscriptionId}`);
+          console.log(`Trial: 30 days (recurring starts ${new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toLocaleDateString()})`);
+        }
+        console.log('='.repeat(60) + '\n');
+      } else {
+        throw new Error(response.data.error || 'Project service returned unsuccessful response');
       }
 
-      await db.insert(projectSteps).values({
-        id: stepId,
-        projectId: newProject.id,
-        name: stepDef.name,
-        description: stepDef.description,
-        status: 'pending',
-        order: stepDef.order,
-        startDate: null,
-        endDate: dueDate,
-        metadata: {
-          estimatedDays: stepDef.estimatedDays,
-          templateName: workflowTemplate.name,
-          autoCreated: true,
-          dependencies: stepDef.dependencies || []
-        },
-        createdAt: new Date(),
-        updatedAt: new Date()
-      });
-    }
+    } catch (error) {
+      // Log the error but don't throw - we don't want to fail the webhook
+      if (axios.isAxiosError(error)) {
+        console.error('[Phoenix Webhook] Project service call failed:', {
+          status: error.response?.status,
+          data: error.response?.data,
+          message: error.message,
+        });
+      } else {
+        console.error('[Phoenix Webhook] Project service call failed:', error instanceof Error ? error.message : error);
+      }
 
-    console.log('[Phoenix Webhook] Workflow steps created successfully');
-
-    // === Log Phoenix Workflow Summary ===
-    console.log('\n' + '='.repeat(60));
-    console.log('[Phoenix Workflow Summary]');
-    console.log(`Case: ${caseType}`);
-    console.log(`Plan: ${invoice.planName}`);
-    console.log(`Client ID: ${clientId}`);
-    console.log(`Project ID: ${newProject.id}`);
-    console.log(`Brief ID: ${newBrief.id}`);
-    if (subscriptionId) {
-      console.log(`Subscription ID: ${subscriptionId}`);
-      console.log(`Trial: 30 days (recurring starts ${new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toLocaleDateString()})`);
+      // In case project-service is down, we could implement a fallback
+      // For now, we just log the error - the payment is still successful
+      console.error('[Phoenix Webhook] CRITICAL: Project creation failed. Manual intervention may be required.');
+      console.error('[Phoenix Webhook] Invoice ID:', invoice.id, '| Client ID:', clientId);
     }
-    console.log('='.repeat(60) + '\n');
 
     // TODO: Send email notification to client about onboarding
     console.log('[Phoenix Webhook] TODO: Send onboarding email to client:', clientId);
@@ -754,6 +662,18 @@ app.listen(config.PORT, () => {
   console.log(`Port: ${config.PORT}`);
   console.log(`Database: Connected`);
   console.log(`Stripe: Initialized`);
+  console.log('='.repeat(50));
+  console.log('');
+  console.log('Routes:');
+  console.log('  GET  /health');
+  console.log('  GET  /catalog');
+  console.log('  GET  /catalog/web');
+  console.log('  GET  /catalog/production');
+  console.log('  GET  /catalog/alacarte');
+  console.log('  GET  /catalog/:slug');
+  console.log('  GET  /auth/session/:sessionId');
+  console.log('  POST /webhook');
+  console.log('');
   console.log('='.repeat(50));
 });
 
