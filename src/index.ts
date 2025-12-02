@@ -493,70 +493,188 @@ async function createProjectAndWorkflow(
     console.log('[Phoenix Webhook] Calling project-service to create project for plan:', invoice.planName);
 
     try {
-      // Call project-service internal endpoint
-      const response = await axios.post(
-        `${config.PROJECT_SERVICE_URL}/internal/projects/create-with-workflow`,
-        {
-          clientId,
-          planId: invoice.planId,
-          planName: invoice.planName,
-          invoiceId: invoice.id,
-          budget: invoice.amount,
-          description: invoice.description || `Project created from ${invoice.planName} plan purchase. Awaiting brief completion.`,
+      let response;
+
+      // Check for dynamic modules in metadata (new multi-module system)
+      const hasModulesJson = metadata.modulesJson;
+      const moduleCount = parseInt(metadata.moduleCount || '0', 10);
+
+      if (hasModulesJson && moduleCount > 0) {
+        // === DYNAMIC MULTI-MODULE PROJECT (Case B or C with multiple items) ===
+        console.log('[Phoenix Webhook] Creating dynamic multi-module project with', moduleCount, 'modules');
+
+        // Parse modules from JSON metadata
+        let modulesData: Array<{ planId: string; planName: string; priceCents: number; type: string }>;
+        try {
+          modulesData = JSON.parse(metadata.modulesJson);
+        } catch (parseError) {
+          console.error('[Phoenix Webhook] Failed to parse modulesJson:', parseError);
+          throw new Error('Invalid modulesJson in metadata');
+        }
+
+        // Transform to project-service format
+        const modules = modulesData.map((mod, index) => ({
+          planId: mod.planId,
+          planName: mod.planName,
+          budget: mod.priceCents ? String(mod.priceCents / 100) : null,
           metadata: {
-            case: caseType,
-            createdVia: 'phoenix_workflow',
-            hasSubscription: !!subscriptionId,
-            webPlanId: metadata.webPlanId,
-            productionPlanId: metadata.productionPlanId,
+            type: mod.type,
+            hasSubscription: mod.type === 'web' && !!subscriptionId,
+            originalPriceCents: mod.priceCents
           }
-        },
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Internal-Secret': config.INTERNAL_SECRET,
+        }));
+
+        console.log('[Phoenix Webhook] Modules to create:', modules.map(m => `${m.planId}(${m.planName})`).join(', '));
+
+        response = await axios.post(
+          `${config.PROJECT_SERVICE_URL}/internal/projects/create-with-modules`,
+          {
+            clientId,
+            invoiceId: invoice.id,
+            totalBudget: invoice.amount,
+            modules,
+            metadata: {
+              case: caseType,
+              createdVia: 'phoenix_workflow_dynamic_multimodule',
+              hasSubscription: !!subscriptionId,
+              moduleCount,
+            }
           },
-          timeout: 10000, // 10 second timeout
+          {
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Internal-Secret': config.INTERNAL_SECRET,
+            },
+            timeout: 30000, // Increased timeout for multiple modules
+          }
+        );
+
+        if (response.data.success) {
+          const { project, modules: createdModules, briefs, steps } = response.data.data;
+          console.log('[Phoenix Webhook] Multi-module project created:', project.id);
+          console.log('[Phoenix Webhook] Modules:', createdModules.length, '| Briefs:', briefs.length, '| Steps:', steps.length);
+
+          await db.update(invoices).set({ projectId: project.id, updatedAt: new Date() }).where(eq(invoices.id, invoice.id));
+
+          console.log('\n' + '='.repeat(60));
+          console.log('[Phoenix Workflow Summary - Dynamic Multi-Module]');
+          console.log(`Case: ${caseType} | Client: ${clientId} | Project: ${project.id}`);
+          console.log(`Total Modules: ${createdModules.length} | Total Briefs: ${briefs.length}`);
+          createdModules.forEach((m: any, i: number) => {
+            console.log(`  Module ${i + 1}: ${m.type} - ${m.planName} (Brief: ${briefs[i]?.id || 'N/A'})`);
+          });
+          if (subscriptionId) console.log(`Subscription: ${subscriptionId} (30 day trial)`);
+          console.log('='.repeat(60) + '\n');
+        } else {
+          throw new Error(response.data.error || 'Project service returned unsuccessful response');
         }
-      );
 
-      if (response.data.success) {
-        const { project, brief, steps } = response.data.data;
-        console.log('[Phoenix Webhook] Project created via project-service:', project.id);
-        console.log('[Phoenix Webhook] Brief created:', brief.id);
-        console.log(`[Phoenix Webhook] ${steps.length} workflow steps created`);
+      } else if (caseType === 'C' && metadata.webPlanId && metadata.productionPlanId) {
+        // === LEGACY: MULTI-MODULE PROJECT (Case C: web + single production) ===
+        // Backward compatibility for old checkout sessions without modulesJson
+        console.log('[Phoenix Webhook] Creating legacy multi-module project (web + production)');
 
-        // Link invoice to project (stays in payment-service)
-        await db
-          .update(invoices)
-          .set({
-            projectId: project.id,
-            updatedAt: new Date()
-          })
-          .where(eq(invoices.id, invoice.id));
+        const modules = [
+          {
+            planId: metadata.webPlanId,
+            planName: metadata.webPlanId === 'growth' ? 'Growth' : metadata.webPlanId,
+            budget: metadata.webPlanBudget || null,
+            metadata: { type: 'web', hasSubscription: true }
+          },
+          {
+            planId: metadata.productionPlanId,
+            planName: metadata.productionPlanId === 'signature' ? 'Signature' : metadata.productionPlanId,
+            budget: metadata.productionPlanBudget || null,
+            metadata: { type: 'production' }
+          }
+        ];
 
-        console.log('[Phoenix Webhook] Invoice linked to project');
+        response = await axios.post(
+          `${config.PROJECT_SERVICE_URL}/internal/projects/create-with-modules`,
+          {
+            clientId,
+            invoiceId: invoice.id,
+            totalBudget: invoice.amount,
+            modules,
+            metadata: {
+              case: caseType,
+              createdVia: 'phoenix_workflow_multimodule_legacy',
+              hasSubscription: !!subscriptionId,
+            }
+          },
+          {
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Internal-Secret': config.INTERNAL_SECRET,
+            },
+            timeout: 15000,
+          }
+        );
 
-        // === Log Phoenix Workflow Summary ===
-        console.log('\n' + '='.repeat(60));
-        console.log('[Phoenix Workflow Summary]');
-        console.log(`Case: ${caseType}`);
-        console.log(`Plan: ${invoice.planName}`);
-        console.log(`Client ID: ${clientId}`);
-        console.log(`Project ID: ${project.id}`);
-        console.log(`Brief ID: ${brief.id}`);
-        console.log(`Steps: ${steps.length}`);
-        if (subscriptionId) {
-          console.log(`Subscription ID: ${subscriptionId}`);
-          console.log(`Trial: 30 days (recurring starts ${new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toLocaleDateString()})`);
+        if (response.data.success) {
+          const { project, modules: createdModules, briefs, steps } = response.data.data;
+          console.log('[Phoenix Webhook] Legacy multi-module project created:', project.id);
+          console.log('[Phoenix Webhook] Modules:', createdModules.length, '| Briefs:', briefs.length, '| Steps:', steps.length);
+
+          await db.update(invoices).set({ projectId: project.id, updatedAt: new Date() }).where(eq(invoices.id, invoice.id));
+
+          console.log('\n' + '='.repeat(60));
+          console.log('[Phoenix Workflow Summary - Multi-Module Legacy]');
+          console.log(`Case: ${caseType} | Client: ${clientId} | Project: ${project.id}`);
+          console.log(`Modules: ${createdModules.map((m: any) => `${m.type}(${m.planName})`).join(', ')}`);
+          if (subscriptionId) console.log(`Subscription: ${subscriptionId} (30 day trial)`);
+          console.log('='.repeat(60) + '\n');
+        } else {
+          throw new Error(response.data.error || 'Project service returned unsuccessful response');
         }
-        console.log('='.repeat(60) + '\n');
+
       } else {
-        throw new Error(response.data.error || 'Project service returned unsuccessful response');
+        // === SINGLE MODULE PROJECT (Case A or simple Case B) ===
+        console.log('[Phoenix Webhook] Creating single-module project');
+
+        response = await axios.post(
+          `${config.PROJECT_SERVICE_URL}/internal/projects/create-with-workflow`,
+          {
+            clientId,
+            planId: invoice.planId,
+            planName: invoice.planName,
+            invoiceId: invoice.id,
+            budget: invoice.amount,
+            metadata: {
+              case: caseType,
+              createdVia: 'phoenix_workflow',
+              hasSubscription: !!subscriptionId,
+              webPlanId: metadata.webPlanId,
+              productionPlanId: metadata.productionPlanId,
+            }
+          },
+          {
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Internal-Secret': config.INTERNAL_SECRET,
+            },
+            timeout: 10000,
+          }
+        );
+
+        if (response.data.success) {
+          const { project, brief, steps } = response.data.data;
+          console.log('[Phoenix Webhook] Project created:', project.id, '| Brief:', brief.id, '| Steps:', steps.length);
+
+          await db.update(invoices).set({ projectId: project.id, updatedAt: new Date() }).where(eq(invoices.id, invoice.id));
+
+          console.log('\n' + '='.repeat(60));
+          console.log('[Phoenix Workflow Summary]');
+          console.log(`Case: ${caseType} | Plan: ${invoice.planName} | Client: ${clientId}`);
+          console.log(`Project: ${project.id} | Brief: ${brief.id} | Steps: ${steps.length}`);
+          if (subscriptionId) console.log(`Subscription: ${subscriptionId} (30 day trial)`);
+          console.log('='.repeat(60) + '\n');
+        } else {
+          throw new Error(response.data.error || 'Project service returned unsuccessful response');
+        }
       }
 
     } catch (error) {
-      // Log the error but don't throw - we don't want to fail the webhook
       if (axios.isAxiosError(error)) {
         console.error('[Phoenix Webhook] Project service call failed:', {
           status: error.response?.status,
@@ -566,14 +684,9 @@ async function createProjectAndWorkflow(
       } else {
         console.error('[Phoenix Webhook] Project service call failed:', error instanceof Error ? error.message : error);
       }
-
-      // In case project-service is down, we could implement a fallback
-      // For now, we just log the error - the payment is still successful
-      console.error('[Phoenix Webhook] CRITICAL: Project creation failed. Manual intervention may be required.');
-      console.error('[Phoenix Webhook] Invoice ID:', invoice.id, '| Client ID:', clientId);
+      console.error('[Phoenix Webhook] CRITICAL: Project creation failed. Invoice:', invoice.id, '| Client:', clientId);
     }
 
-    // TODO: Send email notification to client about onboarding
     console.log('[Phoenix Webhook] TODO: Send onboarding email to client:', clientId);
   } else {
     console.log('[Phoenix Webhook] This is a regular invoice payment (not onboarding)');

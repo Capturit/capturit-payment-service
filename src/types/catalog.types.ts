@@ -62,3 +62,53 @@ export interface CategoryResponse {
     total: number;
   };
 }
+
+// Input types for CRUD operations
+export interface CreateCatalogProductInput {
+  slug: string;
+  name: string;
+  description?: string | null;
+  category: 'web' | 'production' | 'alacarte';
+  type: 'subscription' | 'one_time';
+  price: number; // en centimes
+  monthlyPrice?: number;
+  yearlyPrice?: number;
+  setupFee?: number;
+  currency?: string;
+  billingPeriod?: 'monthly' | 'yearly' | 'one_time';
+  features?: string[];
+  isPopular?: boolean;
+  isCustom?: boolean;
+  displayOrder?: number;
+  isActive?: boolean;
+  storageGb?: number;
+  buttonText?: string;
+}
+
+export interface UpdateCatalogProductInput {
+  name?: string;
+  description?: string | null;
+  price?: number;
+  monthlyPrice?: number;
+  yearlyPrice?: number;
+  setupFee?: number;
+  features?: string[];
+  isPopular?: boolean;
+  isCustom?: boolean;
+  displayOrder?: number;
+  isActive?: boolean;
+  storageGb?: number;
+  buttonText?: string;
+}
+
+export interface MutationResponse {
+  success: boolean;
+  data?: CatalogProduct;
+  error?: string;
+}
+
+export interface DeleteResponse {
+  success: boolean;
+  message?: string;
+  error?: string;
+}
