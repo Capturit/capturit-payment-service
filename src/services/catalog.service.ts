@@ -1,4 +1,6 @@
 import {
+  eq,
+  and,
   pricingPlans,
   plans,
   capturitWebPlan,
@@ -7,7 +9,6 @@ import {
   type Plan,
   type CapturitWebPlan,
 } from '@capturit/shared';
-import { eq, and } from 'drizzle-orm';
 import type { DbClient } from '@capturit/shared';
 import type {
   CatalogProduct,
@@ -22,9 +23,10 @@ export class CatalogService {
    * Récupère tous les produits du catalogue
    */
   async getAllProducts(): Promise<CatalogProduct[]> {
-    const [webPlans, productionPlans, stripeProducts] = await Promise.all([
+    const [webPlans, productionPlans, storagePlans, stripeProducts] = await Promise.all([
       this.getWebPlans(),
       this.getProductionPlans(),
+      this.getStoragePlans(),
       this.db.select().from(products),
     ]);
 
@@ -34,22 +36,26 @@ export class CatalogService {
     // Créer un set des slugs web pour filtrer les doublons
     const webPlanSlugs = new Set(webPlans.map(p => p.slug));
 
-    // Filtrer les plans de production qui ont le même slug qu'un plan web
+    // Créer un set des slugs storage pour filtrer les doublons
+    const storagePlanSlugs = new Set(storagePlans.map(p => p.slug));
+
+    // Filtrer les plans de production qui ont le même slug qu'un plan web OU storage
     const filteredProductionPlans = productionPlans.filter(
-      p => !webPlanSlugs.has(p.slug || '')
+      p => !webPlanSlugs.has(p.slug || '') && !storagePlanSlugs.has(p.slug || '')
     );
 
     // Combiner et transformer
     const allProducts: CatalogProduct[] = [
       ...webPlans.map(plan => this.transformWebPlan(plan, stripeMap.get(plan.slug))),
       ...filteredProductionPlans.map(plan => this.transformProductionPlan(plan, stripeMap.get(plan.slug || ''))),
+      ...storagePlans.map(plan => this.transformStoragePlan(plan, stripeMap.get(plan.slug || ''))),
     ];
 
     // Trier par displayOrder puis par catégorie
     return allProducts.sort((a, b) => {
       if (a.category !== b.category) {
-        const order = { web: 0, production: 1, alacarte: 2 };
-        return order[a.category] - order[b.category];
+        const order: Record<string, number> = { web: 0, production: 1, alacarte: 2, storage: 3 };
+        return (order[a.category] ?? 99) - (order[b.category] ?? 99);
       }
       return a.displayOrder - b.displayOrder;
     });
@@ -83,6 +89,52 @@ export class CatalogService {
   }
 
   /**
+   * Récupère les plans de stockage uniquement
+   */
+  async getStoragePlans(): Promise<Plan[]> {
+    return this.db
+      .select()
+      .from(plans)
+      .where(
+        and(
+          eq(plans.isActive, true),
+          eq(plans.category, 'storage')
+        )
+      )
+      .orderBy(plans.displayOrder);
+  }
+
+  /**
+   * Transforme un plan Storage en CatalogProduct
+   */
+  private transformStoragePlan(
+    plan: Plan,
+    stripeProduct?: typeof products.$inferSelect | null
+  ): CatalogProduct {
+    return {
+      id: `storage-${plan.id}`,
+      slug: plan.slug || plan.id,
+      name: plan.name,
+      description: plan.description,
+      category: 'storage',
+      type: 'subscription',
+      price: plan.priceCents,
+      monthlyPrice: plan.priceCents,
+      yearlyPrice: plan.yearlyPriceCents || Math.round(plan.priceCents * 12 * 0.85),
+      currency: plan.currency,
+      billingPeriod: 'monthly',
+      stripeProductId: stripeProduct?.stripeProductId || plan.stripeProductId || plan.id,
+      stripePriceId: stripeProduct?.stripePriceId || plan.stripePriceId || null,
+      features: (plan.features as string[]) || [],
+      isPopular: plan.isPopular || false,
+      isCustom: plan.isCustom || false,
+      displayOrder: plan.displayOrder || 100,
+      isActive: plan.isActive,
+      storageGb: plan.storageGb || 10,
+    };
+  }
+
+  /**
    * Récupère un produit par son slug
    */
   async getProductBySlug(slug: string): Promise<CatalogProduct | null> {
@@ -102,7 +154,7 @@ export class CatalogService {
       return this.transformWebPlan(webPlan, stripeProduct);
     }
 
-    // Chercher dans production plans
+    // Chercher dans production plans (via VIEW)
     const [productionPlan] = await this.db
       .select()
       .from(pricingPlans)
@@ -116,6 +168,25 @@ export class CatalogService {
         .where(eq(products.id, slug))
         .limit(1);
       return this.transformProductionPlan(productionPlan, stripeProduct);
+    }
+
+    // Chercher dans la table plans (pour storage et autres)
+    const [storagePlan] = await this.db
+      .select()
+      .from(plans)
+      .where(eq(plans.slug, slug))
+      .limit(1);
+
+    if (storagePlan) {
+      const [stripeProduct] = await this.db
+        .select()
+        .from(products)
+        .where(eq(products.id, slug))
+        .limit(1);
+      if (storagePlan.category === 'storage') {
+        return this.transformStoragePlan(storagePlan, stripeProduct);
+      }
+      return this.transformPlanToCatalog(storagePlan);
     }
 
     return null;
@@ -354,9 +425,10 @@ export class CatalogService {
    * Récupère tous les produits (y compris inactifs) pour l'admin
    */
   async getAllProductsAdmin(): Promise<CatalogProduct[]> {
-    const [webPlans, productionPlans, stripeProducts] = await Promise.all([
+    const [webPlans, productionPlans, storagePlans, stripeProducts] = await Promise.all([
       this.db.select().from(capturitWebPlan).orderBy(capturitWebPlan.order),
       this.db.select().from(pricingPlans).orderBy(pricingPlans.displayOrder),
+      this.db.select().from(plans).where(eq(plans.category, 'storage')).orderBy(plans.displayOrder),
       this.db.select().from(products),
     ]);
 
@@ -365,20 +437,24 @@ export class CatalogService {
     // Créer un set des slugs web pour filtrer les doublons
     const webPlanSlugs = new Set(webPlans.map(p => p.slug));
 
-    // Filtrer les plans de production qui ont le même slug qu'un plan web
+    // Créer un set des slugs storage pour filtrer les doublons
+    const storagePlanSlugs = new Set(storagePlans.map(p => p.slug));
+
+    // Filtrer les plans de production qui ont le même slug qu'un plan web OU storage
     const filteredProductionPlans = productionPlans.filter(
-      p => !webPlanSlugs.has(p.slug || '')
+      p => !webPlanSlugs.has(p.slug || '') && !storagePlanSlugs.has(p.slug || '')
     );
 
     const allProducts: CatalogProduct[] = [
       ...webPlans.map(plan => this.transformWebPlan(plan, stripeMap.get(plan.slug))),
       ...filteredProductionPlans.map(plan => this.transformProductionPlan(plan, stripeMap.get(plan.slug || ''))),
+      ...storagePlans.map(plan => this.transformStoragePlan(plan, stripeMap.get(plan.slug || ''))),
     ];
 
     return allProducts.sort((a, b) => {
       if (a.category !== b.category) {
-        const order = { web: 0, production: 1, alacarte: 2 };
-        return order[a.category] - order[b.category];
+        const order: Record<string, number> = { web: 0, production: 1, alacarte: 2, storage: 3 };
+        return (order[a.category] ?? 99) - (order[b.category] ?? 99);
       }
       return a.displayOrder - b.displayOrder;
     });

@@ -7,7 +7,7 @@ export interface CatalogProduct {
   description: string | null;
 
   // Catégorie
-  category: 'web' | 'production' | 'alacarte';
+  category: 'web' | 'production' | 'alacarte' | 'storage';
   type: 'subscription' | 'one_time';
 
   // Prix (en centimes)
@@ -46,6 +46,7 @@ export interface CatalogResponse {
       web: number;
       production: number;
       alacarte: number;
+      storage: number;
     };
   };
 }
@@ -68,7 +69,7 @@ export interface CreateCatalogProductInput {
   slug: string;
   name: string;
   description?: string | null;
-  category: 'web' | 'production' | 'alacarte';
+  category: 'web' | 'production' | 'alacarte' | 'storage';
   type: 'subscription' | 'one_time';
   price: number; // en centimes
   monthlyPrice?: number;

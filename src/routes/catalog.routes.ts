@@ -29,6 +29,7 @@ export function createCatalogRoutes(catalogService: CatalogService): Router {
             web: products.filter(p => p.category === 'web').length,
             production: products.filter(p => p.category === 'production').length,
             alacarte: products.filter(p => p.category === 'alacarte').length,
+            storage: products.filter(p => p.category === 'storage').length,
           },
         },
       };
@@ -119,6 +120,31 @@ export function createCatalogRoutes(catalogService: CatalogService): Router {
   });
 
   /**
+   * GET /catalog/storage
+   * Récupère les options de stockage supplémentaire
+   */
+  router.get('/storage', async (_req: Request, res: Response) => {
+    try {
+      const products = await catalogService.getAllProducts();
+      const storageProducts = products.filter(p => p.category === 'storage');
+
+      const response: CategoryResponse = {
+        success: true,
+        data: storageProducts,
+        meta: { total: storageProducts.length },
+      };
+
+      res.json(response);
+    } catch (error: any) {
+      console.error('[Catalog] Error fetching storage products:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Erreur lors de la récupération des options de stockage',
+      });
+    }
+  });
+
+  /**
    * GET /catalog/admin/all
    * Récupère tous les produits y compris inactifs (pour Dashboard Admin)
    */
@@ -135,6 +161,7 @@ export function createCatalogRoutes(catalogService: CatalogService): Router {
             web: products.filter(p => p.category === 'web').length,
             production: products.filter(p => p.category === 'production').length,
             alacarte: products.filter(p => p.category === 'alacarte').length,
+            storage: products.filter(p => p.category === 'storage').length,
           },
         },
       };
@@ -198,10 +225,10 @@ export function createCatalogRoutes(catalogService: CatalogService): Router {
         });
       }
 
-      if (!['web', 'production', 'alacarte'].includes(input.category)) {
+      if (!['web', 'production', 'alacarte', 'storage'].includes(input.category)) {
         return res.status(400).json({
           success: false,
-          error: 'La catégorie doit être web, production ou alacarte',
+          error: 'La catégorie doit être web, production, alacarte ou storage',
         });
       }
 
