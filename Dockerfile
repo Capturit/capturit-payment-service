@@ -1,76 +1,70 @@
-# Multi-stage build for production
+# Stage 1: Dependencies
+FROM node:20-alpine AS deps
+RUN apk add --no-cache libc6-compat
+
+COPY ./capturit-shared ./capturit-shared
+
+WORKDIR /app
+
+# Install pnpm
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
+# Copy package files
+COPY capturit-payment-service/package.json capturit-payment-service/pnpm-lock.yaml* ./
+
+# Install dependencies (all dependencies needed for build)
+RUN pnpm install --frozen-lockfile
+
+# Stage 2: Builder
 FROM node:20-alpine AS builder
 
-# Set working directory
+COPY --from=deps ./capturit-shared ./capturit-shared
+
 WORKDIR /app
 
-# Install pnpm and TypeScript globally
-RUN npm install -g pnpm typescript
+# Install pnpm
+RUN corepack enable && corepack prepare pnpm@latest --activate
 
-# Copy shared package and build it
-COPY capturit-shared ./capturit-shared
-WORKDIR /app/capturit-shared
-ENV CI=true
-RUN pnpm install --no-frozen-lockfile && pnpm build
+# Copy dependencies from deps stage
+COPY --from=deps /app/node_modules ./node_modules
+COPY ./capturit-payment-service .
 
-# Pack the shared package as a tarball
-RUN pnpm pack
+# Disable telemetry
+ENV NEXT_TELEMETRY_DISABLED=1
 
-# Copy payment-service
-WORKDIR /app/payment-service
-COPY capturit-payment-service/package.json ./
+# Build the application
+RUN pnpm run build
 
-# Replace workspace dependency with tarball path
-RUN sed -i 's|"@capturit/shared": "workspace:\*"|"@capturit/shared": "file:../capturit-shared/capturit-shared-1.0.0.tgz"|' package.json
+# Stage 3: Production dependencies
+FROM node:20-alpine AS prod-deps
+WORKDIR /app
 
-# Install dependencies with build scripts enabled
-RUN pnpm install --no-frozen-lockfile --ignore-scripts=false
+RUN corepack enable && corepack prepare pnpm@latest --activate
 
-# Copy source code
-COPY capturit-payment-service/. .
+# Reuse package.json from builder
+COPY --from=deps /app/package.json /app/pnpm-lock.yaml* ./
 
-# Build TypeScript using global tsc (skip type checking for now to speed up build)
-RUN tsc --skipLibCheck || echo "Build completed with warnings"
+RUN pnpm install --frozen-lockfile --prod --ignore-scripts
 
-# Production image
+# Stage 4 : Runner
 FROM node:20-alpine AS runner
 
-# Install pnpm in production stage
-RUN npm install -g pnpm
+COPY --from=builder ./capturit-shared ./capturit-shared
 
 WORKDIR /app
 
-# Copy package.json first
-COPY --from=builder /app/payment-service/package.json ./package.json
+ENV NODE_ENV=production
 
-# Copy the tarball from shared package
-COPY --from=builder /app/capturit-shared/capturit-shared-1.0.0.tgz /tmp/
+# Copy only production dependencies
+COPY --from=prod-deps /app/node_modules ./node_modules
 
-# Replace workspace dependency with tarball in production
-RUN sed -i 's|"@capturit/shared": "workspace:\*"|"@capturit/shared": "file:/tmp/capturit-shared-1.0.0.tgz"|' package.json
+# Copy compiled code (JavaScript)
+COPY --from=builder /app/dist ./dist
 
-# Install only production dependencies
-RUN pnpm install --prod --no-frozen-lockfile
+# Copy package.json (for version info, etc.)
+COPY --from=builder /app/package.json ./
 
-# Copy built application from builder
-COPY --from=builder /app/payment-service/dist ./dist
+EXPOSE 3000
 
-# Create non-root user
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nodejs -u 1001
-
-# Change ownership
-RUN chown -R nodejs:nodejs /app
-
-# Switch to non-root user
-USER nodejs
-
-# Expose port
-EXPOSE 4004
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-  CMD node -e "require('http').get('http://localhost:4004/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
-
-# Start application
-CMD ["node", "dist/index.js"]
+# Start the compiled server
+CMD ["node", "dist/server.js"]

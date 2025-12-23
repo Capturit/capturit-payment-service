@@ -1,0 +1,15 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: capturit-auth-service/Dockerfile.dev
+    ports:
+      - "3000:4005"
+    volumes:
+      - ./:/app
+      - ./node_modules:/app/node_modules
+      - ../capturit-shared:/capturit-shared
+    environment:
+      NODE_ENV: development
+    stdin_open: true
+    tty: true

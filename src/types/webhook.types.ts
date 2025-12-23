@@ -40,6 +40,7 @@ export interface CheckoutMetadata {
   invoiceDescription?: string;
   modulesJson?: string;
   moduleCount?: string;
+  authMethod?: string;
 }
 
 /**

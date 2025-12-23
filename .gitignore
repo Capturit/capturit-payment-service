@@ -1,8 +1,34 @@
+# Dependencies
 node_modules/
+
+# Build output
+dist/
+
+# Environment files
 .env
 .env.local
-dist/
-build/
-*.log
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
 .DS_Store
-*.tsbuildinfo
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Test coverage
+coverage/
+
+# Temporary files
+tmp/
+temp/
