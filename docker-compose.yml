@@ -1,10 +1,8 @@
 services:
   api:
     build:
-      context: ..
-      dockerfile: capturit-payment-service/Dockerfile
-    ports:
-      - "3006:4005"
+      context: .
+      dockerfile: Dockerfile
     environment:
       NODE_ENV: production
       JWT_SECRET: ${JWT_SECRET}

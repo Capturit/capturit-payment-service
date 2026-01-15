@@ -5,7 +5,8 @@
 
 import { Router, Request, Response, NextFunction } from 'express';
 import Stripe from 'stripe';
-import { eq, inArray, plans, pricingPlans, capturitWebPlan, products, getFrontendConfig, authenticate, AuthRequest, DbClient, invoices, users } from '@capturit/shared';
+import { eq, inArray, getFrontendConfig, authenticate, AuthRequest, DbClient, } from '@capturit/shared';
+import { plans, pricingPlans, capturitWebPlan, products, invoices, users } from '@capturit/shared/schemas';
 import { z } from 'zod';
 import { checkoutSessionLimiter, storageCheckoutLimiter } from '../middleware/rateLimiter';
 import {

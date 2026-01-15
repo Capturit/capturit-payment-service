@@ -1,10 +1,10 @@
 services:
   api:
     build:
-      context: ..
-      dockerfile: capturit-auth-service/Dockerfile.dev
+      context: .
+      dockerfile: Dockerfile.dev
     ports:
-      - "3000:4005"
+      - "4004:4004"
     volumes:
       - ./:/app
       - ./node_modules:/app/node_modules

@@ -1,6 +1,4 @@
 import {
-  eq,
-  and,
   pricingPlans,
   plans,
   capturitWebPlan,
@@ -8,8 +6,10 @@ import {
   type PricingPlan,
   type Plan,
   type CapturitWebPlan,
-} from '@capturit/shared';
-import type { DbClient } from '@capturit/shared';
+} from '@capturit/shared/schemas';
+import {   eq,
+  and, type DbClient } from '@capturit/shared';
+
 import type {
   CatalogProduct,
   CreateCatalogProductInput,

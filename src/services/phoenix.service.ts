@@ -9,21 +9,23 @@ import axios from 'axios';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import {
-  eq,
-  sql,
   invoices,
   clientSubscriptions,
   clientStorageQuotas,
   refreshTokens,
+  users,
+  type UserRole,
+} from '@capturit/shared/schemas';
+import {
+  eq,
+  sql,
+  DbClient,
+  NotificationService,
   generateAccessToken,
   generateRefreshToken,
-  users,
-  NotificationService,
   sendVerificationEmail,
   sendPaymentSuccessNotification,
   sendWelcomeNotification,
-  type UserRole,
-  DbClient,
 } from '@capturit/shared';
 import type {
   PendingAuthToken,

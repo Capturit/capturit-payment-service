@@ -4,7 +4,9 @@
  */
 
 import Stripe from 'stripe';
-import { eq, sql, invoices, clientSubscriptions, clientStorageQuotas, NotificationService, users, DbClient } from '@capturit/shared';
+import { eq, sql } from '@capturit/shared';
+import { invoices, clientSubscriptions, clientStorageQuotas, users } from '@capturit/shared/schemas';
+import { NotificationService,  DbClient } from '@capturit/shared';
 import { PhoenixService } from './phoenix.service';
 import type { PendingAuthToken } from '../types/webhook.types';
 

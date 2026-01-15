@@ -7,14 +7,16 @@ import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import {
   eq,
-  invoices,
-  refreshTokens,
   generateAccessToken,
   generateRefreshToken,
-  users,
   type UserRole,
   DbClient,
 } from '@capturit/shared';
+import {
+  invoices,
+  refreshTokens,
+  users,
+} from '@capturit/shared/schemas'
 import type { PendingAuthToken } from '../types/webhook.types';
 
 export function createSessionRoutes(

@@ -1,25 +1,15 @@
 # Stage 1: Dependencies
-FROM node:20-alpine AS deps
-RUN apk add --no-cache libc6-compat
-
-COPY ./capturit-shared ./capturit-shared
-
+FROM hub.c2.agence418.fr/agence418/builder-os AS deps
 WORKDIR /app
 
-# Install pnpm
-RUN corepack enable && corepack prepare pnpm@latest --activate
-
 # Copy package files
-COPY capturit-payment-service/package.json capturit-payment-service/pnpm-lock.yaml* ./
+COPY package.json pnpm-lock.yaml* ./
 
 # Install dependencies (all dependencies needed for build)
 RUN pnpm install --frozen-lockfile
 
 # Stage 2: Builder
 FROM node:20-alpine AS builder
-
-COPY --from=deps ./capturit-shared ./capturit-shared
-
 WORKDIR /app
 
 # Install pnpm
@@ -27,7 +17,7 @@ RUN corepack enable && corepack prepare pnpm@latest --activate
 
 # Copy dependencies from deps stage
 COPY --from=deps /app/node_modules ./node_modules
-COPY ./capturit-payment-service .
+COPY . .
 
 # Disable telemetry
 ENV NEXT_TELEMETRY_DISABLED=1
@@ -36,7 +26,7 @@ ENV NEXT_TELEMETRY_DISABLED=1
 RUN pnpm run build
 
 # Stage 3: Production dependencies
-FROM node:20-alpine AS prod-deps
+FROM hub.c2.agence418.fr/agence418/builder-os AS prod-deps
 WORKDIR /app
 
 RUN corepack enable && corepack prepare pnpm@latest --activate
@@ -48,9 +38,6 @@ RUN pnpm install --frozen-lockfile --prod --ignore-scripts
 
 # Stage 4 : Runner
 FROM node:20-alpine AS runner
-
-COPY --from=builder ./capturit-shared ./capturit-shared
-
 WORKDIR /app
 
 ENV NODE_ENV=production
